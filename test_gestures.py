@@ -127,6 +127,41 @@ def test_diagonal_motion_is_not_a_swipe():
     assert kinds(feed(e, frames)) == []
 
 
+def test_swipe_survives_motion_blur():
+    # Mid-swipe, the hand blurs: a few frames misclassify and two lose the hand entirely.
+    e = GestureEngine(aspect=1.0)
+    xs = [0.3 + 0.4 * i / 8 for i in range(1, 9)]
+    swipe = [
+        make_hand(ALL, cx=xs[0]),
+        make_hand(("pinky",), cx=xs[1]),
+        make_hand(("pinky",), cx=xs[2]),
+        None,
+        make_hand(("pinky",), cx=xs[4]),
+        None,
+        make_hand(ALL, cx=xs[6]),
+        make_hand(ALL, cx=xs[7]),
+    ]
+    frames = [make_hand(ALL, cx=0.3)] * 5 + swipe
+    assert kinds(feed(e, frames)) == ["swipe_right"]
+
+
+def test_return_stroke_is_ignored():
+    e = GestureEngine(aspect=1.0)
+    right = [make_hand(ALL, cx=0.3 + 0.4 * i / 6) for i in range(1, 7)]
+    back = [make_hand(ALL, cx=0.7 - 0.4 * i / 6) for i in range(1, 7)]  # immediately back
+    frames = [make_hand(ALL, cx=0.3)] * 5 + right + [make_hand(ALL, cx=0.7)] * 3 + back
+    assert kinds(feed(e, frames)) == ["swipe_right"]
+
+
+def test_repeated_swipes_same_direction():
+    # Flick, reset slowly, flick again: should flip two tabs.
+    e = GestureEngine(aspect=1.0)
+    flick = [make_hand(ALL, cx=0.3 + 0.4 * i / 6) for i in range(1, 7)]
+    slow_back = [make_hand(ALL, cx=0.7 - 0.4 * i / 45) for i in range(1, 46)]  # 1.5 s
+    frames = [make_hand(ALL, cx=0.3)] * 5 + flick + slow_back + flick
+    assert kinds(feed(e, frames)) == ["swipe_right", "swipe_right"]
+
+
 def test_swipe_needs_open_palm():
     e = GestureEngine(aspect=1.0)
     frames = [make_hand(("index", "middle"), cx=0.3)] * 5
@@ -142,14 +177,29 @@ def test_scroll_up_when_hand_moves_up():
     frames = [make_hand(("index", "middle"), cy=0.5)] * 5 + [make_hand(("index", "middle"), cy=0.35)] * 30
     scrolls = [ev.value for ev in feed(e, frames) if ev.kind == "scroll"]
     assert scrolls and all(v > 0 for v in scrolls)
-    # 0.15 offset - 0.04 deadzone = 0.11 * 60 gain ~ 6.6 clicks/s, for ~1 s
-    assert 4 <= sum(scrolls) <= 8
+    # (0.15 offset - 0.035 deadzone) * 80 gain ~ 9 notches/s, for ~1 s
+    assert 7 <= sum(scrolls) <= 11
 
 
 def test_scroll_down():
     e = GestureEngine(aspect=1.0)
     frames = [make_hand(("index", "middle"), cy=0.4)] * 5 + [make_hand(("index", "middle"), cy=0.55)] * 30
     assert sum(ev.value for ev in feed(e, frames) if ev.kind == "scroll") < 0
+
+
+def test_scroll_works_with_ring_finger_half_up():
+    e = GestureEngine(aspect=1.0)
+    pose = ("index", "middle", "ring")
+    frames = [make_hand(pose, cy=0.5)] * 5 + [make_hand(pose, cy=0.35)] * 30
+    assert sum(ev.value for ev in feed(e, frames) if ev.kind == "scroll") > 0
+
+
+def test_scroll_units_per_platform():
+    from main import scroll_units
+
+    assert scroll_units(2, "win32") == 240  # Windows: 120 per notch
+    assert scroll_units(2, "darwin") == 6  # macOS: lines
+    assert scroll_units(-2, "linux") == -2
 
 
 def test_scroll_deadzone():

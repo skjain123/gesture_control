@@ -47,6 +47,17 @@ POSE_COLORS = {  # BGR
 }
 
 
+def scroll_units(notches: int, platform: str = sys.platform) -> int:
+    """pyautogui.scroll() means something different on every OS: one wheel-delta
+    unit on Windows (a real notch is 120), one *line* on macOS, one notch on
+    Linux. Convert our notches so scrolling feels about the same everywhere."""
+    if platform == "win32":
+        return notches * 120
+    if platform == "darwin":
+        return notches * 3
+    return notches
+
+
 class ActionRunner:
     """Turns gesture Events into real mouse/keyboard input."""
 
@@ -73,7 +84,7 @@ class ActionRunner:
             # Stay a couple of pixels off the edges so we never trip the corner failsafe ourselves.
             g.moveTo(2 + x * (self.screen_w - 5), 2 + y * (self.screen_h - 5))
         elif ev.kind == "scroll":
-            g.scroll(ev.value)
+            g.scroll(scroll_units(ev.value))
         elif ev.kind == "click":
             g.click()
         elif ev.kind == "swipe_left":  # like flicking a page away: go forward
@@ -100,6 +111,31 @@ def draw_cursor_region(frame, cfg: Config) -> None:
     cv2.rectangle(frame, (int(x0 * w), int(y0 * h)), (int(x1 * w), int(y1 * h)), (80, 80, 80), 1)
 
 
+def draw_scroll_guide(frame, engine: GestureEngine) -> None:
+    """While scrolling: the 'center' line and dead zone. Move your fingertips
+    past the dashed band to scroll; farther = faster."""
+    anchor = engine.scroll_anchor
+    if anchor is None:
+        return
+    h, w = frame.shape[:2]
+    dz = engine.cfg.scroll_deadzone
+    y = int(anchor * h)
+    top, bottom = int((anchor - dz) * h), int((anchor + dz) * h)
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, top), (w, bottom), (0, 200, 255), cv2.FILLED)
+    cv2.addWeighted(overlay, 0.15, frame, 0.85, 0, dst=frame)
+    cv2.line(frame, (0, y), (w, y), (0, 200, 255), 2)
+    cv2.putText(frame, "scroll up", (w - 150, max(top - 10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+    cv2.putText(frame, "scroll down", (w - 170, min(bottom + 25, h - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+
+def draw_swipe_trail(frame, engine: GestureEngine) -> None:
+    trail = engine.swipe_trail
+    h, w = frame.shape[:2]
+    for (x0, y0), (x1, y1) in zip(trail, trail[1:]):
+        cv2.line(frame, (int(x0 * w), int(y0 * h)), (int(x1 * w), int(y1 * h)), (255, 200, 0), 3)
+
+
 def put_text(frame, text, y, color=(255, 255, 255), scale=0.7) -> None:
     cv2.putText(frame, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 4, cv2.LINE_AA)
     cv2.putText(frame, text, (12, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
@@ -112,7 +148,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dry-run", action="store_true", help="print actions instead of performing them")
     p.add_argument("--no-cursor", action="store_true", help="disable point-to-move and pinch-to-click")
     p.add_argument("--scroll-gain", type=float, default=Config.scroll_gain,
-                   help="scroll speed; raise it on macOS, where one scroll click is tiny")  # fmt: skip
+                   help="scroll speed (default %(default)s)")  # fmt: skip
+    p.add_argument("--preview-width", type=int, default=640,
+                   help="width of the camera window, so it fits in a corner (0 = full size)")  # fmt: skip
     return p.parse_args()
 
 
@@ -197,18 +235,25 @@ def main() -> None:
                     paused = True
                     print(f"Paused after error: {exc!r}")
 
-            # --- HUD ---
+            # --- HUD --- (shrink first so text stays readable in the small window)
+            if args.preview_width and w > args.preview_width:
+                frame = cv2.resize(frame, (args.preview_width, int(h * args.preview_width / w)))
+                h, w = frame.shape[:2]
             if not args.no_cursor:
                 draw_cursor_region(frame, cfg)
+            draw_scroll_guide(frame, engine)
+            draw_swipe_trail(frame, engine)
             if landmarks:
                 draw_hand(frame, landmarks, POSE_COLORS.get(engine.pose, (255, 255, 255)))
             dt = now - t_prev
             t_prev = now
             if dt > 0:
                 fps = 0.9 * fps + 0.1 * (1 / dt) if fps else 1 / dt
-            put_text(frame, f"pose: {engine.pose.value}   fps: {fps:.0f}", 30)
+            # "seeing" = this frame's guess; "pose" = what's held long enough to act on.
+            put_text(frame, f"pose: {engine.pose.value}  (seeing: {engine.raw_pose.value})", 30)
+            put_text(frame, f"fps: {fps:.0f}", 60, scale=0.6)
             if now < flash_until:
-                put_text(frame, flash, 62, (0, 255, 255), 0.9)
+                put_text(frame, flash, 95, (0, 255, 255), 1.0)
             if paused:
                 put_text(frame, "PAUSED (p to resume)", h - 20, (0, 0, 255))
 

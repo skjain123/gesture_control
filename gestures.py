@@ -55,7 +55,7 @@ class Pose(str, Enum):
 @dataclass(frozen=True)
 class Event:
     kind: str  # swipe_left | swipe_right | scroll | move | click | close_tab
-    value: object = None  # scroll: int clicks (+ = up); move: (x, y) in 0..1
+    value: object = None  # scroll: int wheel notches (+ = up); move: (x, y) in 0..1
 
 
 @dataclass
@@ -74,14 +74,18 @@ class Config:
     pose_stable_frames: int = 3  # frames a pose must hold before it counts (~100 ms at 30 fps)
 
     # Swipe (open palm moving sideways fast)
-    swipe_window_s: float = 0.30
-    swipe_min_dist: float = 0.30
-    swipe_axis_ratio: float = 2.0  # horizontal travel must be 2x the vertical travel
-    swipe_cooldown_s: float = 0.8  # also swallows the "return stroke" of your hand
+    swipe_window_s: float = 0.40
+    swipe_min_dist: float = 0.25
+    swipe_axis_ratio: float = 1.5  # horizontal travel must be 1.5x the vertical travel
+    # Fast hands blur, so not every frame in a swipe will read as an open palm.
+    # This fraction of the frames in the window must.
+    swipe_min_palm_fraction: float = 0.3
+    swipe_repeat_s: float = 0.5  # same direction again (flip through several tabs)
+    swipe_reverse_s: float = 1.2  # opposite direction: long, to ignore your hand coming back
 
     # Scroll (two fingers, joystick style: offset from where the pose started)
-    scroll_deadzone: float = 0.04
-    scroll_gain: float = 60.0  # scroll clicks per second, per frame-height past the deadzone
+    scroll_deadzone: float = 0.035
+    scroll_gain: float = 80.0  # wheel notches per second, per frame-height past the deadzone
 
     # Cursor (index finger). Region of the *camera* frame (normalized x0, y0, x1, y1)
     # that maps onto the whole screen, so you can reach screen edges comfortably.
@@ -163,7 +167,8 @@ def classify_pose(pts: np.ndarray, cfg: Config, pinching: bool = False) -> Pose:
         return Pose.FIST
     if ext["index"] and n == 1:
         return Pose.POINT
-    if ext["index"] and ext["middle"] and n == 2:
+    # Ring finger is ignored: it tends to drift up along with the middle finger.
+    if ext["index"] and ext["middle"] and not ext["pinky"]:
         return Pose.TWO_FINGERS
     return Pose.OTHER
 
@@ -182,8 +187,8 @@ class GestureEngine:
         self._candidate, self._candidate_count = Pose.NONE, 0
         self._last_t: float | None = None
 
-        self._swipe_hist: deque[tuple[float, np.ndarray]] = deque()
-        self._swipe_cooldown_until = 0.0
+        self._swipe_hist: deque[tuple[float, np.ndarray, Pose]] = deque()
+        self._last_swipe: tuple[str, float] | None = None  # (direction, time)
         self._scroll_anchor: float | None = None
         self._scroll_accum = 0.0
         self._click_cooldown_until = 0.0
@@ -219,9 +224,14 @@ class GestureEngine:
         if self._candidate is not self.pose and self._candidate_count >= self.cfg.pose_stable_frames:
             events += self._transition(self._candidate, t)
 
+        if pts is not None:
+            # Swipes are tracked on every frame with a hand, not only frames that
+            # classify cleanly as an open palm: a fast-moving hand blurs and the
+            # pose flickers, which used to reset the swipe halfway through.
+            events += self._track_swipe(pts, t)
+
         if pts is not None and self.raw_pose is self.pose:
             handler = {
-                Pose.OPEN_PALM: self._on_open_palm,
                 Pose.TWO_FINGERS: self._on_two_fingers,
                 Pose.POINT: self._on_point,
                 Pose.FIST: self._on_fist,
@@ -234,8 +244,6 @@ class GestureEngine:
 
     def _transition(self, new: Pose, t: float) -> list[Event]:
         old, self.pose = self.pose, new
-        if old is Pose.OPEN_PALM:
-            self._swipe_hist.clear()
         if old is Pose.TWO_FINGERS:
             self._scroll_anchor, self._scroll_accum = None, 0.0
 
@@ -249,24 +257,51 @@ class GestureEngine:
             return [Event("click")]
         return []
 
-    # -- per-pose handlers --
+    # -- for the on-screen display --
 
-    def _on_open_palm(self, pts, raw, t, dt) -> list[Event]:
+    @property
+    def scroll_anchor(self) -> float | None:
+        """Normalized y of the scroll 'center', or None when not scrolling."""
+        return self._scroll_anchor
+
+    @property
+    def swipe_trail(self) -> list[tuple[float, float]]:
+        """Recent palm positions (normalized x, y) inside the swipe window."""
+        return [(c[0] / self.aspect, c[1]) for _, c, _ in self._swipe_hist]
+
+    # -- swipe --
+
+    # Stable poses during which a swipe may fire. Not POINT / TWO_FINGERS / PINCH,
+    # so moving the cursor or scrolling never flips tabs.
+    _SWIPE_POSES = (Pose.OPEN_PALM, Pose.OTHER, Pose.NONE)
+
+    def _track_swipe(self, pts, t) -> list[Event]:
         cfg, hist = self.cfg, self._swipe_hist
         center = pts[PALM, :2].mean(axis=0)
-        if t < self._swipe_cooldown_until:
-            hist.clear()
-            return []
-        hist.append((t, center))
+        hist.append((t, center, self.raw_pose))
         while t - hist[0][0] > cfg.swipe_window_s:
             hist.popleft()
+
+        if self.pose not in self._SWIPE_POSES or len(hist) < 2:
+            return []
         dx, dy = center - hist[0][1]
-        if abs(dx) >= cfg.swipe_min_dist and abs(dx) >= cfg.swipe_axis_ratio * abs(dy):
-            hist.clear()
-            self._swipe_cooldown_until = t + cfg.swipe_cooldown_s
-            # Frame is mirrored, so +x is the user's right.
-            return [Event("swipe_right" if dx > 0 else "swipe_left")]
-        return []
+        if abs(dx) < cfg.swipe_min_dist or abs(dx) < cfg.swipe_axis_ratio * abs(dy):
+            return []
+        palm_frames = sum(p is Pose.OPEN_PALM for _, _, p in hist)
+        if palm_frames < cfg.swipe_min_palm_fraction * len(hist):
+            return []
+
+        direction = "swipe_right" if dx > 0 else "swipe_left"  # frame is mirrored: +x = your right
+        hist.clear()
+        if self._last_swipe is not None:
+            last_dir, last_t = self._last_swipe
+            wait = cfg.swipe_repeat_s if direction == last_dir else cfg.swipe_reverse_s
+            if t - last_t < wait:
+                return []  # most likely your hand returning to the middle
+        self._last_swipe = (direction, t)
+        return [Event(direction)]
+
+    # -- per-pose handlers --
 
     def _on_two_fingers(self, pts, raw, t, dt) -> list[Event]:
         cfg = self.cfg
